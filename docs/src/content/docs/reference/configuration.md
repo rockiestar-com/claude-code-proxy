@@ -62,7 +62,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 
 | Environment | Config key | Default | Purpose |
 | --- | --- | --- | --- |
-| `CCP_BIND_ADDRESS` | `bindAddress` | `127.0.0.1` | Listener IP address. |
+| `CCP_BIND_ADDRESS` | `bindAddress` | `127.0.0.1` | Listener IP address. A loopback address also rejects non-loopback `Host` and browser `Origin` values. The proxy has no inbound auth, so a non-loopback address exposes your subscription to that network. |
 | `PORT` | `port` | `18765` | Listener port. |
 | `CCP_CONFIG_DIR` | none | Platform config directory | Replaces the configuration and file-backed auth root. |
 | `CCP_ALIAS_PROVIDER` | `aliasProvider` | `codex` | Routes recognized Anthropic-style aliases through `codex` or `kimi`. |

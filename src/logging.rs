@@ -132,7 +132,17 @@ fn write_log_line(line: &str) -> io::Result<()> {
         rotate_file(&file)?;
     }
 
-    let mut out = OpenOptions::new().create(true).append(true).open(&file)?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut out = options.open(&file)?;
+    // Tighten a log file created by an older version with the default umask.
+    static TIGHTEN_EXISTING: std::sync::Once = std::sync::Once::new();
+    TIGHTEN_EXISTING.call_once(|| set_mode(&file, 0o600));
     out.write_all(line.as_bytes())?;
     out.write_all(b"\n")?;
     Ok(())

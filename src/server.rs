@@ -168,6 +168,13 @@ pub async fn serve_listener(
         ])),
     );
     let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
+    // A loopback listener serves only local clients, so reject browser cross-site
+    // requests and DNS-rebinding Host names. Non-loopback binds keep the old behavior.
+    let app = if local_addr.ip().to_canonical().is_loopback() {
+        app.layer(axum::middleware::from_fn(local_request_guard))
+    } else {
+        app
+    };
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -175,6 +182,53 @@ pub async fn serve_listener(
     .with_graceful_shutdown(shutdown)
     .await?;
     Ok(())
+}
+
+async fn local_request_guard(req: Request<Body>, next: axum::middleware::Next) -> Response {
+    if let Err(message) = check_local_request(req.headers()) {
+        return json_error(StatusCode::FORBIDDEN, "permission_error", message);
+    }
+    next.run(req).await
+}
+
+/// Accept a request only when its `Host` (if any) is a loopback name and its
+/// `Origin` (if any) is a loopback origin.
+fn check_local_request(headers: &http::HeaderMap) -> Result<(), &'static str> {
+    if let Some(host) = headers.get(http::header::HOST) {
+        let host = host.to_str().map_err(|_| "Invalid Host header")?;
+        if !is_loopback_authority(host) {
+            return Err("Host must be a loopback address");
+        }
+    }
+    if let Some(origin) = headers.get(http::header::ORIGIN) {
+        let origin = origin.to_str().map_err(|_| "Invalid Origin header")?;
+        let local = url::Url::parse(origin)
+            .ok()
+            .and_then(|url| url.host_str().map(is_loopback_host))
+            .unwrap_or(false);
+        if !local {
+            return Err("Cross-origin browser requests are not allowed");
+        }
+    }
+    Ok(())
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host),
+    };
+    is_loopback_host(host)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 pub fn app(registry: Arc<Registry>) -> Router {
@@ -2406,5 +2460,63 @@ mod auto_review_tests {
             apply_auto_review_model(&mut classifier, true, Some("grok-4.5"), "codex").is_none()
         );
         assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-sol"));
+    }
+}
+
+#[cfg(test)]
+mod local_request_guard_tests {
+    use super::check_local_request;
+    use http::{HeaderMap, HeaderValue, header};
+
+    fn headers(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(name.clone(), HeaderValue::from_str(value).unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn accepts_loopback_hosts_and_missing_headers() {
+        for host in [
+            "127.0.0.1:18765",
+            "localhost:18765",
+            "LOCALHOST",
+            "[::1]:18765",
+            "127.0.0.1",
+        ] {
+            assert!(
+                check_local_request(&headers(&[(header::HOST, host)])).is_ok(),
+                "{host}"
+            );
+        }
+        assert!(check_local_request(&HeaderMap::new()).is_ok());
+    }
+
+    #[test]
+    fn rejects_rebinding_hosts() {
+        for host in [
+            "evil.example:18765",
+            "192.168.1.5:18765",
+            "localhost.evil.example",
+        ] {
+            assert!(
+                check_local_request(&headers(&[(header::HOST, host)])).is_err(),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_cross_origin_browser_requests() {
+        for origin in ["https://evil.example", "null", "http://192.168.1.5"] {
+            let map = headers(&[(header::HOST, "127.0.0.1:18765"), (header::ORIGIN, origin)]);
+            assert!(check_local_request(&map).is_err(), "{origin}");
+        }
+        let map = headers(&[
+            (header::HOST, "127.0.0.1:18765"),
+            (header::ORIGIN, "http://localhost:3000"),
+        ]);
+        assert!(check_local_request(&map).is_ok());
     }
 }

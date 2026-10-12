@@ -3,6 +3,14 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- A proxy that listens on a loopback address now rejects requests whose `Host`
+  is not a loopback name, and browser requests from a non-loopback `Origin`.
+  This blocks cross-site requests and DNS rebinding from web pages.
+- `proxy.log` is created with mode 0600.
+- Docs: `gpt-6.1-sol` uses a 500K auto-compact window.
+
 ## v0.1.45 (2026-10-10)
 
 - Codex users can request the ultrafast service tier with
