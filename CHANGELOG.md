@@ -10,6 +10,11 @@ description: Release notes for claude-code-proxy.
   This blocks cross-site requests and DNS rebinding from web pages.
 - `proxy.log` is created with mode 0600.
 - Docs: `gpt-6.1-sol` uses a 500K auto-compact window.
+- Codex server compaction keeps a prompt that Claude Code merges into the
+  summary message. Before, the first prompt after `/compact` was dropped and
+  the model answered an older turn.
+- Compaction unit tests no longer clear the whole registry, which made a
+  continuation test fail at random.
 
 ## v0.1.45 (2026-10-10)
 

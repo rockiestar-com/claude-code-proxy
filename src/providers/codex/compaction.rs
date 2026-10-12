@@ -216,7 +216,14 @@ pub fn apply_compaction_replay(
         update_total_bytes(registry);
         return None;
     }
-    if conversation.len() == 1 {
+    // Claude Code can merge the summary and the next prompt into one user
+    // message. Keep the parts after the summary so the new prompt survives.
+    let Some(trailing) = parts_after_summary(summary_item, portable_summary) else {
+        registry.states.remove(session_id);
+        update_total_bytes(registry);
+        return None;
+    };
+    if conversation.len() == 1 && trailing.is_none() {
         return None;
     }
 
@@ -225,6 +232,7 @@ pub fn apply_compaction_replay(
         .iter()
         .cloned()
         .chain(state.native_history.iter().cloned())
+        .chain(trailing)
         .chain(conversation[1..].iter().cloned())
         .collect();
     if serialized_size(&replay.input) > MAX_STATE_BYTES {
@@ -328,6 +336,29 @@ fn portable_summary_text(output: &[ResponsesInputItem]) -> Option<String> {
         .filter(|summary| !summary.is_empty())
         .unwrap_or(trimmed);
     (summary.len() >= MIN_PORTABLE_SUMMARY_BYTES).then(|| summary.to_string())
+}
+
+/// Returns `None` when no single content part holds the summary, otherwise
+/// `Some(message)` with the parts after the summary part (`Some(None)` if none).
+fn parts_after_summary(
+    item: &ResponsesInputItem,
+    portable_summary: &str,
+) -> Option<Option<ResponsesInputItem>> {
+    let ResponsesInputItem::Message { role, content } = item else {
+        return None;
+    };
+    let index = content.iter().position(|part| {
+        matches!(
+            part,
+            ResponsesContentPart::InputText { text } | ResponsesContentPart::OutputText { text }
+                if text.contains(portable_summary)
+        )
+    })?;
+    let rest = content[index + 1..].to_vec();
+    Some((!rest.is_empty()).then(|| ResponsesInputItem::Message {
+        role: role.clone(),
+        content: rest,
+    }))
 }
 
 fn message_text(item: &ResponsesInputItem) -> Option<String> {
@@ -562,6 +593,13 @@ mod tests {
         "stale portable summary from an older overlapping compaction attempt";
     static TEST_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Clear only this module's sessions. Clearing the whole registry races
+    /// with tests in other modules that use the registry without this lock.
+    fn clear_test_sessions() {
+        clear_compaction("session");
+        clear_compaction("failed-replay");
+    }
+
     fn request(input: serde_json::Value) -> ResponsesRequest {
         serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
@@ -623,7 +661,7 @@ mod tests {
     #[test]
     fn replay_requires_activation_and_wrapped_summary_anchor() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
-        clear_all_compactions_for_tests();
+        clear_test_sessions();
         let attempt = stored_compaction(
             "session",
             vec![ResponsesInputItem::Compaction {
@@ -664,9 +702,48 @@ mod tests {
     }
 
     #[test]
+    fn replay_keeps_prompt_merged_into_summary_message() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_test_sessions();
+        let attempt = stored_compaction(
+            "session",
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "opaque".to_string(),
+            }],
+        );
+        assert!(activate_compaction(
+            Some("session"),
+            Some(attempt),
+            "gpt-5.6-sol",
+            &output(&format!("<summary>{SUMMARY}</summary>"))
+        ));
+        let next = request(json!([
+            {"type":"message","role":"developer","content":[{"type":"input_text","text":"instructions"}]},
+            {"type":"message","role":"user","content":[
+                {"type":"input_text","text":"<system-reminder>context</system-reminder>"},
+                {"type":"input_text","text":format!("This session is being continued.\n{SUMMARY}")},
+                {"type":"input_text","text":"What was the code word?"}
+            ]}
+        ]));
+
+        let replay = apply_compaction_replay(Some("session"), &next)
+            .unwrap()
+            .request;
+        assert_eq!(replay.input.len(), 3);
+        assert!(matches!(
+            replay.input[1],
+            ResponsesInputItem::Compaction { .. }
+        ));
+        assert_eq!(
+            message_text(&replay.input[2]).as_deref(),
+            Some("What was the code word?")
+        );
+    }
+
+    #[test]
     fn stale_activation_cannot_anchor_newer_native_history() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
-        clear_all_compactions_for_tests();
+        clear_test_sessions();
         let older = stored_compaction(
             "session",
             vec![ResponsesInputItem::Compaction {
@@ -697,7 +774,7 @@ mod tests {
     #[test]
     fn stale_store_cannot_replace_newer_compaction() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
-        clear_all_compactions_for_tests();
+        clear_test_sessions();
         let older = begin_compaction("session", "gpt-5.6-sol");
         let newer = stored_compaction(
             "session",
@@ -736,7 +813,7 @@ mod tests {
     #[test]
     fn preparing_compaction_survives_model_mismatched_replay_check() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
-        clear_all_compactions_for_tests();
+        clear_test_sessions();
         let attempt = begin_compaction("session", "gpt-5.6-sol");
         let mut mismatched = request(json!([
             {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
@@ -756,7 +833,7 @@ mod tests {
     #[test]
     fn stale_abort_cannot_clear_newer_compaction() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
-        clear_all_compactions_for_tests();
+        clear_test_sessions();
         let older = begin_compaction("session", "gpt-5.6-sol");
         let newer = stored_compaction(
             "session",
@@ -778,7 +855,7 @@ mod tests {
     #[test]
     fn stale_replay_abort_cannot_clear_newer_compaction() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
-        clear_all_compactions_for_tests();
+        clear_test_sessions();
         let older = stored_compaction(
             "session",
             vec![ResponsesInputItem::Compaction {
@@ -829,7 +906,7 @@ mod tests {
     #[test]
     fn invalid_stale_summary_cannot_clear_newer_compaction() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
-        clear_all_compactions_for_tests();
+        clear_test_sessions();
         let older = begin_compaction("session", "gpt-5.6-sol");
         let newer = stored_compaction(
             "session",
@@ -859,7 +936,7 @@ mod tests {
             "different conversation without the expected summary".to_string(),
             format!("{SUMMARY} and {SUMMARY}"),
         ] {
-            clear_all_compactions_for_tests();
+            clear_test_sessions();
             let attempt = stored_compaction(
                 "session",
                 vec![ResponsesInputItem::Compaction {
@@ -904,7 +981,7 @@ mod tests {
     #[test]
     fn failed_replay_clears_anchored_state() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
-        clear_all_compactions_for_tests();
+        clear_test_sessions();
         let attempt = stored_compaction(
             "failed-replay",
             vec![ResponsesInputItem::Compaction {
@@ -931,7 +1008,7 @@ mod tests {
     #[test]
     fn replay_clears_on_model_change() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
-        clear_all_compactions_for_tests();
+        clear_test_sessions();
         let attempt = stored_compaction(
             "session",
             vec![ResponsesInputItem::Compaction {
